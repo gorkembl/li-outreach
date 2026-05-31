@@ -1,0 +1,20 @@
+{
+  "name": "li-outreach",
+  "version": "0.1.0",
+  "description": "LinkedIn outreach automation via ConnectSafely API with Claude-powered personalization",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "init-sheet": "node src/index.js --init-sheet-only",
+    "dry-run": "DRY_RUN=true node src/index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "googleapis": "^144.0.0",
+    "dotenv": "^16.4.5"
+  }
+}
