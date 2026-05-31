@@ -1,130 +1,148 @@
-// config.js
-// All tunable parameters. Edit here to adjust system behavior without touching logic.
+// claude.js
+// Claude integration for personalization context and DM generation.
 
-export const SHEET_TABS = {
-  LISTS: 'Lists',
-  LEADS: 'Leads',
-  ACTION_LOG: 'ActionLog',
-  CONVERSATIONS: 'Conversations',
-  DASHBOARD: 'Dashboard',
-};
+import Anthropic from '@anthropic-ai/sdk';
+import { CLAUDE, FLAGS } from './config.js';
 
-// Sheet column schemas. Order matters — these are used to create headers
-// and to read/write rows by position.
-export const SCHEMAS = {
-  Lists: [
-    'list_id', 'name', 'target_side', 'service_type',
-    'goal', 'tone', 'region', 'active', 'created_at',
-  ],
-  Leads: [
-    'lead_id', 'list_id', 'profile_url', 'linkedin_id', 'name', 'headline',
-    'timezone', 'status', 'phase', 'sequence_step', 'qualified_at',
-    'personalization_context',
-    'last_action', 'last_action_at', 'next_action_at',
-    'response_received', 'notes', 'created_at',
-  ],
-  ActionLog: [
-    'timestamp', 'lead_id', 'action', 'result', 'details',
-  ],
-  Conversations: [
-    'timestamp', 'lead_id', 'direction', 'channel', 'message_text', 'needs_review',
-  ],
-};
+let client = null;
 
-// Valid status values. Used for dropdown validation in Sheets.
-export const STATUSES = [
-  'queued',         // just added, not yet processed
-  'qualifying',     // qualification in progress
-  'qualified',      // ready to enter sequence
-  'skipped',        // failed qualification (inactive, etc)
-  'viewing',        // phase 1 active
-  'following',      // phase 1 follow done
-  'warming',        // phase 2 active (likes, comments)
-  'connecting',     // phase 3, connection request sent
-  'connected',      // connection accepted
-  'dm_sent',        // phase 4 first DM sent
-  'follow_up_sent', // follow-up DM sent
-  'replied',        // they replied, human takes over
-  'dropped',        // no reply, end of sequence
-  'error',          // tech error, needs review
-  'paused',         // manually paused by user
-];
+export function initClaude() {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error('ANTHROPIC_API_KEY env var missing');
+  client = new Anthropic({ apiKey: key });
+  console.log('[claude] initialized');
+}
 
-export const TARGET_SIDES = ['investor', 'deal_side'];
-export const ACTION_RESULTS = ['success', 'error', 'skipped'];
-export const DIRECTIONS = ['incoming', 'outgoing'];
-export const CHANNELS = ['dm', 'comment_reply', 'connection_note'];
+// ----- Extract personalization context from profile + posts -----
+export async function extractContext(profile, posts) {
+  const sys = `You are analyzing a LinkedIn profile to prepare for highly personalized outreach.
+Extract structured signals that will inform later engagement and messaging decisions.
+Respond ONLY with valid JSON, no preamble, no markdown code blocks.`;
 
-// Phase definitions. Each step: {day_offset, action, jitter_hours}
-// day_offset is days since lead became "qualified"
-// jitter_hours = random hours added/subtracted to the scheduled time
-export const SEQUENCE = [
-  // Phase 1: silent recognition
-  { phase: 1, day: 1, action: 'view',    jitter_hours: 4 },
-  { phase: 1, day: 3, action: 'follow',  jitter_hours: 4 },
+  const user = `PROFILE:
+Name: ${profile.name || 'unknown'}
+Headline: ${profile.headline || ''}
+Location: ${profile.location || ''}
+About: ${(profile.about || '').slice(0, 1500)}
+Experience summary: ${JSON.stringify(profile.experience?.slice(0, 3) || [])}
 
-  // Phase 2: passive engagement
-  { phase: 2, day: 5, action: 'like',    jitter_hours: 6 },
-  { phase: 2, day: 7, action: 'like',    jitter_hours: 6 },
-  { phase: 2, day: 9, action: 'comment', jitter_hours: 6 },
+RECENT POSTS (last ${posts.length}):
+${posts.map((p, i) => `[${i + 1}] ${(p.text || '').slice(0, 400)}`).join('\n\n')}
 
-  // Phase 3: active engagement
-  { phase: 3, day: 12, action: 'comment', jitter_hours: 8 },
-  { phase: 3, day: 15, action: 'connect', jitter_hours: 8 },
-  { phase: 3, day: 17, action: 'like',    jitter_hours: 12 }, // post-connect settle
-  { phase: 3, day: 19, action: 'like',    jitter_hours: 12 }, // continue settle
+Return JSON with this shape:
+{
+  "themes": ["..."],              // 3-5 main topics they engage with
+  "tone": "...",                  // their writing tone, e.g. "formal/casual/hot-take/educator"
+  "activity_level": "...",        // "very active" | "active" | "occasional" | "dormant"
+  "days_since_last_post": 0,
+  "skip_reason": null,            // string if we should skip them, null otherwise
+  "hook_post_id": null,           // index (1-based) of best post to reference for first engagement
+  "hook_post_reason": "...",
+  "inferred_timezone": "...",     // e.g. "America/New_York", "Europe/Berlin" — best guess
+  "region_category": "...",       // "US" | "EU" | "UK" | "GCC" | "APAC" | "LATAM" | "OTHER"
+  "language": "..."               // primary language of their posts, ISO code e.g. "en", "tr", "de"
+}
 
-  // Phase 4: DM
-  { phase: 4, day: 21, action: 'dm',         jitter_hours: 8 },
-  { phase: 4, day: 28, action: 'follow_up',  jitter_hours: 12 },
-];
+Be honest: if posts are 60+ days old or profile looks dormant, set skip_reason.`;
 
-// Volume and rate limits
-export const LIMITS = {
-  // Maximum NEW leads to qualify per day (entering sequence)
-  daily_new_leads: parseInt(process.env.DAILY_NEW_LEADS || '5', 10),
-  // Maximum total actions per day across all leads
-  daily_total_actions: parseInt(process.env.DAILY_TOTAL_ACTIONS || '40', 10),
-  // ConnectSafely follow limit (their stated limit)
-  cs_follow_per_day: 100,
-  // Min seconds between any two actions
-  min_seconds_between_actions: 240, // 4 minutes
-};
+  const res = await client.messages.create({
+    model: CLAUDE.model,
+    max_tokens: CLAUDE.max_tokens_context,
+    system: sys,
+    messages: [{ role: 'user', content: user }],
+  });
 
-// Working hours in lead's local timezone (24h format)
-export const WORKING_HOURS = {
-  start: 9,   // 09:00
-  end: 18,    // 18:00
-  // Probability of skipping a weekend day entirely
-  weekend_skip_probability: 0.7,
-  // Probability of a random weekday "off day"
-  weekday_skip_probability: 0.08,
-};
+  const text = res.content[0].text.trim();
+  // Strip markdown fences if any
+  const clean = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+  return JSON.parse(clean);
+}
 
-// Drop and qualification criteria
-export const CRITERIA = {
-  // Skip lead if they haven't posted in this many days
-  max_days_since_last_post: 60,
-  // Days to wait for connection request acceptance before drop
-  connection_timeout_days: 7,
-  // Days to wait for DM reply before sending follow-up
-  dm_followup_wait_days: 7,
-  // Days after follow-up to drop if still no reply
-  followup_drop_days: 7,
-};
+// ----- Generate comment for engagement -----
+export async function generateComment(lead, list, targetPost) {
+  const sys = `You write LinkedIn comments that sound like a thoughtful peer adding value.
+Never salesy. Never compliment-fishing. Add a perspective, a question, or a concrete experience.
+Match the post's tone. 1-2 sentences max. No emojis unless the original post used them heavily.`;
 
-// Claude model selection
-export const CLAUDE = {
-  model: 'claude-sonnet-4-5',
-  max_tokens_context: 1500,
-  max_tokens_dm: 400,
-  max_tokens_comment: 200,
-};
+  const user = `You are commenting as someone in this role: investment brokerage professional.
+The post you're commenting on:
+"""
+${targetPost.text}
+"""
 
-// Behavior toggles
-export const FLAGS = {
-  dry_run: process.env.DRY_RUN === 'true',
-  init_sheet_only: process.argv.includes('--init-sheet-only'),
-  // EU/UK/UK regions get opt-out line appended to first DM (GDPR)
-  gdpr_regions: ['EU', 'UK', 'EEA'],
-};
+Author context: ${JSON.stringify(lead.personalization_context?.themes || [])}
+Tone target: ${list.tone}
+Language: ${lead.personalization_context?.language || 'en'}
+
+Write ONE comment. Plain text only, no quotes, no preamble.`;
+
+  const res = await client.messages.create({
+    model: CLAUDE.model,
+    max_tokens: CLAUDE.max_tokens_comment,
+    system: sys,
+    messages: [{ role: 'user', content: user }],
+  });
+
+  return res.content[0].text.trim();
+}
+
+// ----- Generate first DM -----
+export async function generateDM(lead, list, isFollowUp = false) {
+  const ctx = lead.personalization_context || {};
+  const sideLabel = list.target_side === 'investor'
+    ? 'an investor (HNW, family office, fund, or accredited)'
+    : 'a business owner / founder';
+
+  const sys = `You write LinkedIn DMs for an investment brokerage / advisory firm.
+The recipient is ${sideLabel}.
+The brokerage is licensed via a partner broker-dealer.
+
+Hard rules:
+- 60-90 words for first DM, 40-60 for follow-up.
+- Open with a specific, concrete reference to one of their posts or stated interests (never generic).
+- Bridge: why you're reaching out, in plain language. No jargon spray.
+- Soft ask: a question or an open invitation. No "book a call" links in first message.
+- Never name specific securities or deals (regulatory).
+- Match their writing tone.
+- No exclamation marks. No "Hope this finds you well." No "I came across your profile."
+- Sign off with first name only (the sender's name will be appended separately).
+- Plain text. No emojis unless their tone clearly uses them.`;
+
+  const gdprNote = FLAGS.gdpr_regions.includes(ctx.region_category)
+    ? '\n- Add a brief line at the end like "If outreach like this isn\'t welcome, just let me know and I\'ll leave you be." (GDPR opt-out, in their language)'
+    : '';
+
+  const followUpNote = isFollowUp
+    ? '\n- This is a FOLLOW-UP after a prior unanswered DM. Acknowledge briefly, add new angle, do not guilt-trip.'
+    : '';
+
+  const user = `LIST CONTEXT
+List name: ${list.name}
+Goal: ${list.goal}
+Tone: ${list.tone}
+Target side: ${list.target_side}
+Service type: ${list.service_type}
+
+LEAD CONTEXT
+Name: ${lead.name}
+Headline: ${lead.headline}
+Themes: ${JSON.stringify(ctx.themes || [])}
+Their tone: ${ctx.tone || 'unknown'}
+Language: ${ctx.language || 'en'}
+Region: ${ctx.region_category || 'unknown'}
+Hook post reason: ${ctx.hook_post_reason || 'no specific hook captured'}
+
+Write the DM in ${ctx.language || 'en'}.
+${gdprNote}${followUpNote}
+
+Plain text only. Just the DM body.`;
+
+  const res = await client.messages.create({
+    model: CLAUDE.model,
+    max_tokens: CLAUDE.max_tokens_dm,
+    system: sys,
+    messages: [{ role: 'user', content: user }],
+  });
+
+  return res.content[0].text.trim();
+}

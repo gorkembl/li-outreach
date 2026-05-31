@@ -1,148 +1,177 @@
-// claude.js
-// Claude integration for personalization context and DM generation.
+// stateMachine.js
+// Core decision logic. Given a lead's state, determines next action.
 
-import Anthropic from '@anthropic-ai/sdk';
-import { CLAUDE, FLAGS } from './config.js';
+import { SEQUENCE, CRITERIA, WORKING_HOURS, LIMITS } from './config.js';
 
-let client = null;
+// Returns an action plan for a lead, or null if nothing to do right now.
+// Possible returns:
+//   { action: 'qualify' }
+//   { action: 'start_sequence' }  -- first scheduling after qualification
+//   { action: 'view'|'follow'|'like'|'comment'|'connect'|'dm'|'follow_up', step }
+//   { action: 'check_connection' }
+//   { action: 'drop', reason }
+//   null  (skip this run)
+export function decideNextAction(lead, now = new Date()) {
+  const status = lead.status || 'queued';
 
-export function initClaude() {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error('ANTHROPIC_API_KEY env var missing');
-  client = new Anthropic({ apiKey: key });
-  console.log('[claude] initialized');
+  // Terminal states — nothing to do
+  if (['replied', 'dropped', 'skipped', 'error', 'paused'].includes(status)) {
+    return null;
+  }
+
+  // Queued — needs qualification
+  if (status === 'queued') {
+    return { action: 'qualify' };
+  }
+
+  // Just qualified — schedule first step
+  if (status === 'qualified') {
+    return { action: 'start_sequence' };
+  }
+
+  // Connecting — check if connection accepted
+  if (status === 'connecting') {
+    const qualifiedAt = parseDate(lead.qualified_at);
+    if (!qualifiedAt) return null;
+    const connectStep = SEQUENCE.find(s => s.action === 'connect');
+    const connectDay = connectStep?.day || 15;
+    const daysSinceConnect = daysBetween(addDays(qualifiedAt, connectDay), now);
+    if (daysSinceConnect >= CRITERIA.connection_timeout_days) {
+      return { action: 'drop', reason: 'connection_not_accepted' };
+    }
+    // Check status if next_action_at has passed
+    if (isDue(lead.next_action_at, now)) {
+      return { action: 'check_connection' };
+    }
+    return null;
+  }
+
+  // Active states — check if due for next step
+  if (['viewing', 'following', 'warming', 'connected', 'dm_sent', 'follow_up_sent'].includes(status)) {
+    if (!isDue(lead.next_action_at, now)) return null;
+    if (!isWithinWorkingHours(now, lead.timezone)) return null;
+
+    const stepIdx = parseInt(lead.sequence_step, 10);
+    const nextIdx = isNaN(stepIdx) ? 0 : stepIdx + 1;
+
+    if (nextIdx >= SEQUENCE.length) {
+      // Reached end of sequence
+      if (status === 'dm_sent' || status === 'follow_up_sent') {
+        const lastActionAt = parseDate(lead.last_action_at);
+        const dropAfter = status === 'follow_up_sent'
+          ? CRITERIA.followup_drop_days
+          : CRITERIA.dm_followup_wait_days + CRITERIA.followup_drop_days;
+        if (lastActionAt && daysBetween(lastActionAt, now) >= dropAfter) {
+          return { action: 'drop', reason: 'no_reply' };
+        }
+      }
+      return null;
+    }
+
+    const step = SEQUENCE[nextIdx];
+    return { action: step.action, step, stepIdx: nextIdx };
+  }
+
+  return null;
 }
 
-// ----- Extract personalization context from profile + posts -----
-export async function extractContext(profile, posts) {
-  const sys = `You are analyzing a LinkedIn profile to prepare for highly personalized outreach.
-Extract structured signals that will inform later engagement and messaging decisions.
-Respond ONLY with valid JSON, no preamble, no markdown code blocks.`;
+// ----- Working hours and timezone helpers -----
+export function isWithinWorkingHours(now, timezone) {
+  if (!timezone) timezone = 'UTC';
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: 'numeric',
+      hour12: false,
+      weekday: 'short',
+    });
+    const parts = fmt.formatToParts(now);
+    const hour = parseInt(parts.find(p => p.type === 'hour').value, 10);
+    const weekday = parts.find(p => p.type === 'weekday').value;
 
-  const user = `PROFILE:
-Name: ${profile.name || 'unknown'}
-Headline: ${profile.headline || ''}
-Location: ${profile.location || ''}
-About: ${(profile.about || '').slice(0, 1500)}
-Experience summary: ${JSON.stringify(profile.experience?.slice(0, 3) || [])}
+    const isWeekend = weekday === 'Sat' || weekday === 'Sun';
+    if (isWeekend && Math.random() < WORKING_HOURS.weekend_skip_probability) return false;
+    if (!isWeekend && Math.random() < WORKING_HOURS.weekday_skip_probability) return false;
 
-RECENT POSTS (last ${posts.length}):
-${posts.map((p, i) => `[${i + 1}] ${(p.text || '').slice(0, 400)}`).join('\n\n')}
-
-Return JSON with this shape:
-{
-  "themes": ["..."],              // 3-5 main topics they engage with
-  "tone": "...",                  // their writing tone, e.g. "formal/casual/hot-take/educator"
-  "activity_level": "...",        // "very active" | "active" | "occasional" | "dormant"
-  "days_since_last_post": 0,
-  "skip_reason": null,            // string if we should skip them, null otherwise
-  "hook_post_id": null,           // index (1-based) of best post to reference for first engagement
-  "hook_post_reason": "...",
-  "inferred_timezone": "...",     // e.g. "America/New_York", "Europe/Berlin" — best guess
-  "region_category": "...",       // "US" | "EU" | "UK" | "GCC" | "APAC" | "LATAM" | "OTHER"
-  "language": "..."               // primary language of their posts, ISO code e.g. "en", "tr", "de"
+    return hour >= WORKING_HOURS.start && hour < WORKING_HOURS.end;
+  } catch (e) {
+    // Invalid timezone, fall back to UTC working hours
+    const hour = now.getUTCHours();
+    return hour >= WORKING_HOURS.start && hour < WORKING_HOURS.end;
+  }
 }
 
-Be honest: if posts are 60+ days old or profile looks dormant, set skip_reason.`;
+// Compute the next_action_at for a given sequence step, based on qualifiedAt.
+export function computeNextActionAt(qualifiedAt, step, lead) {
+  const base = addDays(qualifiedAt, step.day);
+  // Random hours of jitter (+/-)
+  const jitterMs = (Math.random() * 2 - 1) * step.jitter_hours * 3600 * 1000;
+  const target = new Date(base.getTime() + jitterMs);
 
-  const res = await client.messages.create({
-    model: CLAUDE.model,
-    max_tokens: CLAUDE.max_tokens_context,
-    system: sys,
-    messages: [{ role: 'user', content: user }],
-  });
-
-  const text = res.content[0].text.trim();
-  // Strip markdown fences if any
-  const clean = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-  return JSON.parse(clean);
+  // Snap to working hours in lead's timezone
+  return snapToWorkingHours(target, lead.timezone || 'UTC');
 }
 
-// ----- Generate comment for engagement -----
-export async function generateComment(lead, list, targetPost) {
-  const sys = `You write LinkedIn comments that sound like a thoughtful peer adding value.
-Never salesy. Never compliment-fishing. Add a perspective, a question, or a concrete experience.
-Match the post's tone. 1-2 sentences max. No emojis unless the original post used them heavily.`;
+function snapToWorkingHours(date, timezone) {
+  // If target time is outside working hours, push to next working window
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: 'numeric',
+      hour12: false,
+    });
+    const hour = parseInt(fmt.formatToParts(date).find(p => p.type === 'hour').value, 10);
 
-  const user = `You are commenting as someone in this role: investment brokerage professional.
-The post you're commenting on:
-"""
-${targetPost.text}
-"""
-
-Author context: ${JSON.stringify(lead.personalization_context?.themes || [])}
-Tone target: ${list.tone}
-Language: ${lead.personalization_context?.language || 'en'}
-
-Write ONE comment. Plain text only, no quotes, no preamble.`;
-
-  const res = await client.messages.create({
-    model: CLAUDE.model,
-    max_tokens: CLAUDE.max_tokens_comment,
-    system: sys,
-    messages: [{ role: 'user', content: user }],
-  });
-
-  return res.content[0].text.trim();
+    if (hour < WORKING_HOURS.start) {
+      // Push forward to start of working hours same day
+      const diff = WORKING_HOURS.start - hour + Math.random() * 3; // a bit of variance
+      return new Date(date.getTime() + diff * 3600 * 1000);
+    }
+    if (hour >= WORKING_HOURS.end) {
+      // Push to next morning
+      const hoursToNext = (24 - hour) + WORKING_HOURS.start + Math.random() * 2;
+      return new Date(date.getTime() + hoursToNext * 3600 * 1000);
+    }
+    return date;
+  } catch {
+    return date;
+  }
 }
 
-// ----- Generate first DM -----
-export async function generateDM(lead, list, isFollowUp = false) {
-  const ctx = lead.personalization_context || {};
-  const sideLabel = list.target_side === 'investor'
-    ? 'an investor (HNW, family office, fund, or accredited)'
-    : 'a business owner / founder';
+// ----- Date utilities -----
+function parseDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
 
-  const sys = `You write LinkedIn DMs for an investment brokerage / advisory firm.
-The recipient is ${sideLabel}.
-The brokerage is licensed via a partner broker-dealer.
+function isDue(nextActionAt, now) {
+  const target = parseDate(nextActionAt);
+  if (!target) return true; // no time set = treat as due
+  return now >= target;
+}
 
-Hard rules:
-- 60-90 words for first DM, 40-60 for follow-up.
-- Open with a specific, concrete reference to one of their posts or stated interests (never generic).
-- Bridge: why you're reaching out, in plain language. No jargon spray.
-- Soft ask: a question or an open invitation. No "book a call" links in first message.
-- Never name specific securities or deals (regulatory).
-- Match their writing tone.
-- No exclamation marks. No "Hope this finds you well." No "I came across your profile."
-- Sign off with first name only (the sender's name will be appended separately).
-- Plain text. No emojis unless their tone clearly uses them.`;
+function addDays(date, days) {
+  return new Date(date.getTime() + days * 24 * 3600 * 1000);
+}
 
-  const gdprNote = FLAGS.gdpr_regions.includes(ctx.region_category)
-    ? '\n- Add a brief line at the end like "If outreach like this isn\'t welcome, just let me know and I\'ll leave you be." (GDPR opt-out, in their language)'
-    : '';
+function daysBetween(a, b) {
+  return Math.floor((b.getTime() - a.getTime()) / (24 * 3600 * 1000));
+}
 
-  const followUpNote = isFollowUp
-    ? '\n- This is a FOLLOW-UP after a prior unanswered DM. Acknowledge briefly, add new angle, do not guilt-trip.'
-    : '';
-
-  const user = `LIST CONTEXT
-List name: ${list.name}
-Goal: ${list.goal}
-Tone: ${list.tone}
-Target side: ${list.target_side}
-Service type: ${list.service_type}
-
-LEAD CONTEXT
-Name: ${lead.name}
-Headline: ${lead.headline}
-Themes: ${JSON.stringify(ctx.themes || [])}
-Their tone: ${ctx.tone || 'unknown'}
-Language: ${ctx.language || 'en'}
-Region: ${ctx.region_category || 'unknown'}
-Hook post reason: ${ctx.hook_post_reason || 'no specific hook captured'}
-
-Write the DM in ${ctx.language || 'en'}.
-${gdprNote}${followUpNote}
-
-Plain text only. Just the DM body.`;
-
-  const res = await client.messages.create({
-    model: CLAUDE.model,
-    max_tokens: CLAUDE.max_tokens_dm,
-    system: sys,
-    messages: [{ role: 'user', content: user }],
-  });
-
-  return res.content[0].text.trim();
+// ----- Status transitions for each action -----
+// Returns the new status after executing a given action successfully.
+export function statusAfterAction(action) {
+  const map = {
+    qualify: 'qualified',
+    view: 'viewing',
+    follow: 'following',
+    like: 'warming',
+    comment: 'warming',
+    connect: 'connecting',
+    check_connection: null, // depends on result
+    dm: 'dm_sent',
+    follow_up: 'follow_up_sent',
+  };
+  return map[action];
 }
