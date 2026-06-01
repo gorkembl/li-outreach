@@ -2,16 +2,23 @@
 // Entry point. Runs once per invocation (called by GitHub Actions cron every 30 min).
 
 import 'dotenv/config';
-import { initSheets, ensureSchema, getAllLeads, getAllLists, getListById, updateLead, logAction, logConversation } from './sheets.js';
-import { initConnectSafely, fetchProfile, fetchProfilePosts, viewProfile, follow, likePost, commentOnPost, sendConnectionRequest, checkConnectionStatus, sendMessage, getRecentConversations, recordRateLimit } from './connectsafely.js';
+import {
+  initSheets, ensureSchema, getAllLeads, getAllLists, updateLead,
+  logAction, logConversation,
+} from './sheets.js';
+import {
+  initConnectSafely, extractProfileId,
+  fetchProfile, fetchProfilePosts, visitProfile, followProfile,
+  reactToPost, commentOnPost, sendConnectionRequest, checkRelationship,
+  sendMessageWithTyping, getRecentMessages, recordRateLimit,
+} from './connectsafely.js';
 import { initClaude, extractContext, generateComment, generateDM } from './claude.js';
 import { decideNextAction, computeNextActionAt, statusAfterAction } from './stateMachine.js';
-import { SEQUENCE, LIMITS, FLAGS, CRITERIA } from './config.js';
+import { SEQUENCE, LIMITS, FLAGS } from './config.js';
 
 async function main() {
   console.log('=== li-outreach run started', new Date().toISOString(), '===');
 
-  // ---- Initialize all clients ----
   await initSheets();
   await ensureSchema();
 
@@ -23,23 +30,19 @@ async function main() {
   initConnectSafely();
   initClaude();
 
-  // ---- Poll for new replies first (so we can pause those sequences) ----
+  // Poll for replies first
   await pollReplies();
 
-  // ---- Fetch all data ----
   const allLeads = await getAllLeads();
   const allLists = await getAllLists();
   const listById = Object.fromEntries(allLists.map(l => [l.list_id, l]));
 
   console.log(`[main] ${allLeads.length} total leads, ${allLists.length} lists`);
 
-  // ---- Daily counters ----
-  let actionsToday = 0;       // total across all
-  let newLeadsToday = 0;      // qualified today
-
+  let actionsToday = 0;
+  let newLeadsToday = 0;
   const now = new Date();
 
-  // ---- Shuffle leads for fairness ----
   const shuffled = [...allLeads].sort(() => Math.random() - 0.5);
 
   for (const lead of shuffled) {
@@ -51,27 +54,19 @@ async function main() {
     const plan = decideNextAction(lead, now);
     if (!plan) continue;
 
-    // Enforce new-lead-per-day cap
-    if (plan.action === 'qualify') {
-      if (newLeadsToday >= LIMITS.daily_new_leads) continue;
-    }
+    if (plan.action === 'qualify' && newLeadsToday >= LIMITS.daily_new_leads) continue;
 
     const list = listById[lead.list_id];
     if (!list && plan.action !== 'qualify') {
       console.warn(`[main] lead ${lead.lead_id} has unknown list_id ${lead.list_id}`);
       continue;
     }
-    if (list && list.active && list.active.toString().toLowerCase() === 'false') {
-      // List paused
-      continue;
-    }
+    if (list && list.active && String(list.active).toLowerCase() === 'false') continue;
 
     try {
       await executeAction(lead, list, plan);
       actionsToday++;
       if (plan.action === 'qualify') newLeadsToday++;
-
-      // Sleep between actions for human-like cadence
       await sleep(LIMITS.min_seconds_between_actions * 1000 + Math.random() * 60_000);
     } catch (e) {
       console.error(`[main] error on lead ${lead.lead_id} action ${plan.action}:`, e.message);
@@ -85,7 +80,12 @@ async function main() {
   console.log(`=== run complete: ${actionsToday} actions, ${newLeadsToday} new leads qualified ===`);
 }
 
-// ---- Execute a single planned action ----
+// Get the profileId for a lead. Prefer the stored linkedin_id;
+// fall back to extracting from profile_url.
+function leadProfileId(lead) {
+  return lead.linkedin_id || extractProfileId(lead.profile_url);
+}
+
 async function executeAction(lead, list, plan) {
   console.log(`[exec] ${lead.lead_id} (${lead.name || lead.profile_url}) -> ${plan.action}`);
 
@@ -95,30 +95,18 @@ async function executeAction(lead, list, plan) {
   }
 
   switch (plan.action) {
-    case 'qualify':
-      return await actionQualify(lead, list);
-    case 'start_sequence':
-      return await actionStartSequence(lead, list);
-    case 'view':
-      return await actionView(lead, plan);
-    case 'follow':
-      return await actionFollow(lead, plan);
-    case 'like':
-      return await actionLike(lead, list, plan);
-    case 'comment':
-      return await actionComment(lead, list, plan);
-    case 'connect':
-      return await actionConnect(lead, plan);
-    case 'check_connection':
-      return await actionCheckConnection(lead, plan);
-    case 'dm':
-      return await actionDM(lead, list, plan, false);
-    case 'follow_up':
-      return await actionDM(lead, list, plan, true);
-    case 'drop':
-      return await actionDrop(lead, plan.reason);
-    default:
-      throw new Error(`unknown action: ${plan.action}`);
+    case 'qualify':           return await actionQualify(lead, list);
+    case 'start_sequence':    return await actionStartSequence(lead, list);
+    case 'view':              return await actionView(lead, plan);
+    case 'follow':            return await actionFollow(lead, plan);
+    case 'like':              return await actionLike(lead, list, plan);
+    case 'comment':           return await actionComment(lead, list, plan);
+    case 'connect':           return await actionConnect(lead, plan);
+    case 'check_connection':  return await actionCheckConnection(lead, plan);
+    case 'dm':                return await actionDM(lead, list, plan, false);
+    case 'follow_up':         return await actionDM(lead, list, plan, true);
+    case 'drop':              return await actionDrop(lead, plan.reason);
+    default: throw new Error(`unknown action: ${plan.action}`);
   }
 }
 
@@ -128,33 +116,45 @@ async function actionQualify(lead, list) {
   lead.status = 'qualifying';
   await updateLead(lead);
 
-  const profileRes = await fetchProfile(lead.profile_url);
+  const profileId = extractProfileId(lead.profile_url);
+  if (!profileId) throw new Error(`could not extract profileId from URL: ${lead.profile_url}`);
+
+  const profileRes = await fetchProfile(profileId);
   recordRateLimit(profileRes.rateLimit);
   const profile = profileRes.data;
 
-  const postsRes = await fetchProfilePosts(lead.profile_url, 10);
+  const postsRes = await fetchProfilePosts(profileId, 10);
   recordRateLimit(postsRes.rateLimit);
   const posts = postsRes.data.posts || postsRes.data || [];
 
-  const ctx = await extractContext(profile, posts);
+  // Normalize profile fields for Claude
+  const profileForClaude = {
+    name: [profile.firstName, profile.lastName].filter(Boolean).join(' ') || profile.name,
+    headline: profile.headline,
+    location: profile.location || profile.geoLocation,
+    about: profile.summary || profile.about,
+    experience: profile.currentPositions || profile.experience,
+  };
 
-  // Skip if qualification says so
+  const ctx = await extractContext(profileForClaude, posts);
+
   if (ctx.skip_reason) {
     lead.status = 'skipped';
+    lead.linkedin_id = profileId;
     lead.notes = `Skipped: ${ctx.skip_reason}`;
     await updateLead(lead);
     await logAction(lead.lead_id, 'qualify', 'skipped', ctx.skip_reason);
     return;
   }
 
-  lead.name = profile.name || lead.name;
+  lead.name = profileForClaude.name || lead.name;
   lead.headline = profile.headline || lead.headline;
-  lead.linkedin_id = profile.linkedin_id || profile.id || '';
+  lead.linkedin_id = profileId;
   lead.timezone = ctx.inferred_timezone || lead.timezone || 'UTC';
   lead.personalization_context = JSON.stringify(ctx);
   lead.status = 'qualified';
   lead.qualified_at = new Date().toISOString();
-  lead.sequence_step = -1;
+  lead.sequence_step = '-1';
   lead.last_action = 'qualify';
   lead.last_action_at = new Date().toISOString();
 
@@ -163,7 +163,6 @@ async function actionQualify(lead, list) {
 }
 
 async function actionStartSequence(lead, list) {
-  // Just schedule the first step (don't execute it yet)
   const firstStep = SEQUENCE[0];
   const qualifiedAt = new Date(lead.qualified_at);
   const nextAt = computeNextActionAt(qualifiedAt, firstStep, lead);
@@ -177,45 +176,47 @@ async function actionStartSequence(lead, list) {
 }
 
 async function actionView(lead, plan) {
-  const res = await viewProfile(lead.profile_url);
+  const pid = leadProfileId(lead);
+  const res = await visitProfile(pid);
   recordRateLimit(res.rateLimit);
   await advanceLead(lead, plan, 'view');
   await logAction(lead.lead_id, 'view', 'success');
 }
 
 async function actionFollow(lead, plan) {
-  const res = await follow(lead.profile_url);
+  const pid = leadProfileId(lead);
+  const res = await followProfile(pid);
   recordRateLimit(res.rateLimit);
   await advanceLead(lead, plan, 'follow');
   await logAction(lead.lead_id, 'follow', 'success');
 }
 
 async function actionLike(lead, list, plan) {
-  // Get fresh posts and pick the most recent one we haven't engaged on
-  const postsRes = await fetchProfilePosts(lead.profile_url, 5);
+  const pid = leadProfileId(lead);
+  const postsRes = await fetchProfilePosts(pid, 5);
   recordRateLimit(postsRes.rateLimit);
   const posts = postsRes.data.posts || postsRes.data || [];
   if (!posts.length) throw new Error('no posts available to like');
 
-  // Pick a recent post (rotation could be smarter; for v1, take latest)
   const target = posts[0];
-  const postUrn = target.urn || target.post_urn || target.id;
+  const postUrn = target.urn || target.postUrn || target.shareUrn || target.id;
   if (!postUrn) throw new Error('post URN not found in response');
 
-  const res = await likePost(postUrn);
+  const res = await reactToPost(postUrn, 'LIKE');
   recordRateLimit(res.rateLimit);
   await advanceLead(lead, plan, 'like');
   await logAction(lead.lead_id, 'like', 'success', `post=${postUrn}`);
 }
 
 async function actionComment(lead, list, plan) {
-  const postsRes = await fetchProfilePosts(lead.profile_url, 5);
+  const pid = leadProfileId(lead);
+  const postsRes = await fetchProfilePosts(pid, 5);
   recordRateLimit(postsRes.rateLimit);
   const posts = postsRes.data.posts || postsRes.data || [];
   if (!posts.length) throw new Error('no posts available to comment on');
 
   const target = posts[0];
-  const postUrn = target.urn || target.post_urn || target.id;
+  const postUrn = target.urn || target.postUrn || target.shareUrn || target.id;
   if (!postUrn) throw new Error('post URN not found');
 
   const ctx = typeof lead.personalization_context === 'string'
@@ -223,16 +224,19 @@ async function actionComment(lead, list, plan) {
     : (lead.personalization_context || {});
   lead.personalization_context = ctx;
 
-  const commentText = await generateComment(lead, list, target);
+  // Normalize target for Claude
+  const targetForClaude = { text: target.content || target.text || target.commentary || '' };
+
+  const commentText = await generateComment(lead, list, targetForClaude);
   const res = await commentOnPost(postUrn, commentText);
   recordRateLimit(res.rateLimit);
   await advanceLead(lead, plan, 'comment');
-  await logAction(lead.lead_id, 'comment', 'success', `text=${commentText.slice(0, 80)}...`);
+  await logAction(lead.lead_id, 'comment', 'success', commentText.slice(0, 100));
 }
 
 async function actionConnect(lead, plan) {
-  // Send connection request without a note (statistically better acceptance)
-  const res = await sendConnectionRequest(lead.profile_url);
+  const pid = leadProfileId(lead);
+  const res = await sendConnectionRequest(pid, null);
   recordRateLimit(res.rateLimit);
 
   lead.status = 'connecting';
@@ -240,21 +244,20 @@ async function actionConnect(lead, plan) {
   lead.sequence_step = String(plan.stepIdx);
   lead.last_action = 'connect';
   lead.last_action_at = new Date().toISOString();
-  // Set next check in 2 days
   lead.next_action_at = new Date(Date.now() + 2 * 24 * 3600 * 1000).toISOString();
   await updateLead(lead);
   await logAction(lead.lead_id, 'connect', 'success');
 }
 
 async function actionCheckConnection(lead, plan) {
-  const res = await checkConnectionStatus(lead.profile_url);
+  const pid = leadProfileId(lead);
+  const res = await checkRelationship(pid);
   recordRateLimit(res.rateLimit);
-  const status = (res.data.status || res.data.connection_status || '').toLowerCase();
+  const degree = (res.data.connectionDegree || res.data.distance || '').toString().toUpperCase();
+  const isConnected = degree.includes('DISTANCE_1') || degree === '1' || degree === '1ST';
 
-  if (status === 'connected' || status === 'accepted' || status === '1st') {
-    // Move to connected, schedule next step
+  if (isConnected) {
     lead.status = 'connected';
-    // Find the post-connect step (next in sequence after connect)
     const connectIdx = SEQUENCE.findIndex(s => s.action === 'connect');
     const nextStep = SEQUENCE[connectIdx + 1];
     if (nextStep) {
@@ -263,23 +266,26 @@ async function actionCheckConnection(lead, plan) {
       lead.sequence_step = String(connectIdx);
     }
     await updateLead(lead);
-    await logAction(lead.lead_id, 'check_connection', 'success', 'accepted');
+    await logAction(lead.lead_id, 'check_connection', 'success', `accepted, degree=${degree}`);
   } else {
-    // Still pending — schedule another check
     lead.next_action_at = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
     await updateLead(lead);
-    await logAction(lead.lead_id, 'check_connection', 'success', `still ${status}`);
+    await logAction(lead.lead_id, 'check_connection', 'success', `pending, degree=${degree}`);
   }
 }
 
 async function actionDM(lead, list, plan, isFollowUp) {
+  const pid = leadProfileId(lead);
   const ctx = typeof lead.personalization_context === 'string'
     ? JSON.parse(lead.personalization_context || '{}')
     : (lead.personalization_context || {});
   lead.personalization_context = ctx;
 
   const text = await generateDM(lead, list, isFollowUp);
-  const res = await sendMessage(lead.profile_url, text);
+
+  // Simulate human typing speed: 200-300 chars/min ~ 4-5 chars/sec
+  const typingMs = Math.min(text.length * 220, 12000);
+  const res = await sendMessageWithTyping(pid, text, typingMs);
   recordRateLimit(res.rateLimit);
 
   await advanceLead(lead, plan, isFollowUp ? 'follow_up' : 'dm');
@@ -294,7 +300,6 @@ async function actionDrop(lead, reason) {
   await logAction(lead.lead_id, 'drop', 'success', reason);
 }
 
-// ---- Helper: advance lead to next step in sequence ----
 async function advanceLead(lead, plan, actionName) {
   const newStatus = statusAfterAction(actionName);
   if (newStatus) lead.status = newStatus;
@@ -303,7 +308,6 @@ async function advanceLead(lead, plan, actionName) {
   lead.last_action = actionName;
   lead.last_action_at = new Date().toISOString();
 
-  // Schedule next step
   const nextStep = SEQUENCE[plan.stepIdx + 1];
   if (nextStep) {
     const qualifiedAt = new Date(lead.qualified_at);
@@ -317,58 +321,43 @@ async function advanceLead(lead, plan, actionName) {
 // ---- Reply polling ----
 async function pollReplies() {
   try {
-    // Get last 24h of conversations
-    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-    const res = await getRecentConversations(since);
+    const res = await getRecentMessages(true); // unread only
     recordRateLimit(res.rateLimit);
-    const conversations = res.data.conversations || res.data || [];
-
-    if (!conversations.length) return;
+    const conversations = res.data.conversations || res.data.messages || res.data || [];
+    if (!Array.isArray(conversations) || !conversations.length) return;
 
     const allLeads = await getAllLeads();
-    const leadsByLinkedinId = {};
-    const leadsByUrl = {};
+    const leadsByProfileId = {};
     allLeads.forEach(l => {
-      if (l.linkedin_id) leadsByLinkedinId[l.linkedin_id] = l;
-      if (l.profile_url) leadsByUrl[normalizeUrl(l.profile_url)] = l;
+      const pid = leadProfileId(l);
+      if (pid) leadsByProfileId[pid.toLowerCase()] = l;
     });
 
     for (const conv of conversations) {
-      // Find incoming messages we haven't seen yet
-      const msgs = conv.messages || [];
-      for (const m of msgs) {
-        if (m.direction !== 'incoming' && m.is_from_user !== true) continue;
-        const senderId = m.sender_id || conv.participant_id;
-        const senderUrl = m.sender_url || conv.participant_url;
-        const lead = leadsByLinkedinId[senderId] || leadsByUrl[normalizeUrl(senderUrl || '')];
-        if (!lead) continue;
+      const senderId = (conv.senderProfileId || conv.participantProfileId || conv.profileId || '').toLowerCase();
+      if (!senderId) continue;
+      const lead = leadsByProfileId[senderId];
+      if (!lead) continue;
+      if (lead.status === 'replied') continue;
 
-        // Mark as replied and stop sequence
-        if (lead.status !== 'replied') {
-          lead.status = 'replied';
-          lead.response_received = 'true';
-          lead.next_action_at = '';
-          await updateLead(lead);
-          await logConversation(lead.lead_id, 'incoming', 'dm', m.text || m.body || '', true);
-          await logAction(lead.lead_id, 'reply_received', 'success', (m.text || '').slice(0, 100));
-          console.log(`[poll] REPLY from ${lead.name || lead.profile_url}`);
-        }
-      }
+      const messageText = conv.lastMessage || conv.message || conv.preview || '';
+      lead.status = 'replied';
+      lead.response_received = 'true';
+      lead.next_action_at = '';
+      await updateLead(lead);
+      await logConversation(lead.lead_id, 'incoming', 'dm', messageText, true);
+      await logAction(lead.lead_id, 'reply_received', 'success', messageText.slice(0, 100));
+      console.log(`[poll] REPLY from ${lead.name || lead.profile_url}`);
     }
   } catch (e) {
     console.error('[poll] error:', e.message);
   }
 }
 
-function normalizeUrl(url) {
-  return (url || '').replace(/\/$/, '').toLowerCase();
-}
-
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ---- Run ----
 main().catch(e => {
   console.error('FATAL:', e);
   process.exit(1);
