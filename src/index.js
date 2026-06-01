@@ -16,8 +16,12 @@ import { initClaude, extractContext, generateComment, generateDM } from './claud
 import { decideNextAction, computeNextActionAt, statusAfterAction } from './stateMachine.js';
 import { SEQUENCE, LIMITS, FLAGS } from './config.js';
 
+// In dry_run, sleep this long between actions (in ms). Normal mode uses LIMITS.
+const DRY_RUN_SLEEP_MS = 5_000;
+
 async function main() {
   console.log('=== li-outreach run started', new Date().toISOString(), '===');
+  if (FLAGS.dry_run) console.log('*** DRY RUN MODE — no LinkedIn side effects will occur ***');
 
   await initSheets();
   await ensureSchema();
@@ -30,7 +34,6 @@ async function main() {
   initConnectSafely();
   initClaude();
 
-  // Poll for replies first
   await pollReplies();
 
   const allLeads = await getAllLeads();
@@ -67,7 +70,10 @@ async function main() {
       await executeAction(lead, list, plan);
       actionsToday++;
       if (plan.action === 'qualify') newLeadsToday++;
-      await sleep(LIMITS.min_seconds_between_actions * 1000 + Math.random() * 60_000);
+      const sleepMs = FLAGS.dry_run
+        ? DRY_RUN_SLEEP_MS
+        : (LIMITS.min_seconds_between_actions * 1000 + Math.random() * 60_000);
+      await sleep(sleepMs);
     } catch (e) {
       console.error(`[main] error on lead ${lead.lead_id} action ${plan.action}:`, e.message);
       lead.status = 'error';
@@ -80,19 +86,12 @@ async function main() {
   console.log(`=== run complete: ${actionsToday} actions, ${newLeadsToday} new leads qualified ===`);
 }
 
-// Get the profileId for a lead. Prefer the stored linkedin_id;
-// fall back to extracting from profile_url.
 function leadProfileId(lead) {
   return lead.linkedin_id || extractProfileId(lead.profile_url);
 }
 
 async function executeAction(lead, list, plan) {
   console.log(`[exec] ${lead.lead_id} (${lead.name || lead.profile_url}) -> ${plan.action}`);
-
-  if (FLAGS.dry_run) {
-    await logAction(lead.lead_id, plan.action, 'success', '[DRY RUN]');
-    return;
-  }
 
   switch (plan.action) {
     case 'qualify':           return await actionQualify(lead, list);
@@ -111,23 +110,29 @@ async function executeAction(lead, list, plan) {
 }
 
 // ---- Action handlers ----
+// Read-only actions (qualify, check_connection) always run, even in dry_run.
+// Side-effect actions skip the actual ConnectSafely call when dry_run=true
+// but still generate content (DM, comment) via Claude so output can be inspected.
 
 async function actionQualify(lead, list) {
+  // Always runs — no LinkedIn side effect (just data reads).
   lead.status = 'qualifying';
   await updateLead(lead);
 
   const profileId = extractProfileId(lead.profile_url);
   if (!profileId) throw new Error(`could not extract profileId from URL: ${lead.profile_url}`);
 
+  console.log(`[qualify] fetching profile: ${profileId}`);
   const profileRes = await fetchProfile(profileId);
   recordRateLimit(profileRes.rateLimit);
   const profile = profileRes.data;
 
+  console.log(`[qualify] fetching posts: ${profileId}`);
   const postsRes = await fetchProfilePosts(profileId, 10);
   recordRateLimit(postsRes.rateLimit);
   const posts = postsRes.data.posts || postsRes.data || [];
+  console.log(`[qualify] got ${Array.isArray(posts) ? posts.length : 0} posts`);
 
-  // Normalize profile fields for Claude
   const profileForClaude = {
     name: [profile.firstName, profile.lastName].filter(Boolean).join(' ') || profile.name,
     headline: profile.headline,
@@ -136,7 +141,9 @@ async function actionQualify(lead, list) {
     experience: profile.currentPositions || profile.experience,
   };
 
+  console.log(`[qualify] calling Claude for context extraction`);
   const ctx = await extractContext(profileForClaude, posts);
+  console.log(`[qualify] claude result: themes=${JSON.stringify(ctx.themes)} skip=${ctx.skip_reason || 'no'} lang=${ctx.language} region=${ctx.region_category}`);
 
   if (ctx.skip_reason) {
     lead.status = 'skipped';
@@ -177,18 +184,28 @@ async function actionStartSequence(lead, list) {
 
 async function actionView(lead, plan) {
   const pid = leadProfileId(lead);
-  const res = await visitProfile(pid);
-  recordRateLimit(res.rateLimit);
+  if (FLAGS.dry_run) {
+    console.log(`[DRY] would visit profile ${pid}`);
+    await logAction(lead.lead_id, 'view', 'success', '[DRY RUN]');
+  } else {
+    const res = await visitProfile(pid);
+    recordRateLimit(res.rateLimit);
+    await logAction(lead.lead_id, 'view', 'success');
+  }
   await advanceLead(lead, plan, 'view');
-  await logAction(lead.lead_id, 'view', 'success');
 }
 
 async function actionFollow(lead, plan) {
   const pid = leadProfileId(lead);
-  const res = await followProfile(pid);
-  recordRateLimit(res.rateLimit);
+  if (FLAGS.dry_run) {
+    console.log(`[DRY] would follow ${pid}`);
+    await logAction(lead.lead_id, 'follow', 'success', '[DRY RUN]');
+  } else {
+    const res = await followProfile(pid);
+    recordRateLimit(res.rateLimit);
+    await logAction(lead.lead_id, 'follow', 'success');
+  }
   await advanceLead(lead, plan, 'follow');
-  await logAction(lead.lead_id, 'follow', 'success');
 }
 
 async function actionLike(lead, list, plan) {
@@ -202,10 +219,15 @@ async function actionLike(lead, list, plan) {
   const postUrn = target.urn || target.postUrn || target.shareUrn || target.id;
   if (!postUrn) throw new Error('post URN not found in response');
 
-  const res = await reactToPost(postUrn, 'LIKE');
-  recordRateLimit(res.rateLimit);
+  if (FLAGS.dry_run) {
+    console.log(`[DRY] would LIKE post ${postUrn}`);
+    await logAction(lead.lead_id, 'like', 'success', `[DRY RUN] post=${postUrn}`);
+  } else {
+    const res = await reactToPost(postUrn, 'LIKE');
+    recordRateLimit(res.rateLimit);
+    await logAction(lead.lead_id, 'like', 'success', `post=${postUrn}`);
+  }
   await advanceLead(lead, plan, 'like');
-  await logAction(lead.lead_id, 'like', 'success', `post=${postUrn}`);
 }
 
 async function actionComment(lead, list, plan) {
@@ -224,21 +246,31 @@ async function actionComment(lead, list, plan) {
     : (lead.personalization_context || {});
   lead.personalization_context = ctx;
 
-  // Normalize target for Claude
   const targetForClaude = { text: target.content || target.text || target.commentary || '' };
-
   const commentText = await generateComment(lead, list, targetForClaude);
-  const res = await commentOnPost(postUrn, commentText);
-  recordRateLimit(res.rateLimit);
+  console.log(`[comment] generated: ${commentText}`);
+
+  if (FLAGS.dry_run) {
+    console.log(`[DRY] would COMMENT on post ${postUrn}: "${commentText}"`);
+    await logAction(lead.lead_id, 'comment', 'success', `[DRY RUN] ${commentText.slice(0, 100)}`);
+  } else {
+    const res = await commentOnPost(postUrn, commentText);
+    recordRateLimit(res.rateLimit);
+    await logAction(lead.lead_id, 'comment', 'success', commentText.slice(0, 100));
+  }
   await advanceLead(lead, plan, 'comment');
-  await logAction(lead.lead_id, 'comment', 'success', commentText.slice(0, 100));
 }
 
 async function actionConnect(lead, plan) {
   const pid = leadProfileId(lead);
-  const res = await sendConnectionRequest(pid, null);
-  recordRateLimit(res.rateLimit);
-
+  if (FLAGS.dry_run) {
+    console.log(`[DRY] would send connection request to ${pid}`);
+    await logAction(lead.lead_id, 'connect', 'success', '[DRY RUN]');
+  } else {
+    const res = await sendConnectionRequest(pid, null);
+    recordRateLimit(res.rateLimit);
+    await logAction(lead.lead_id, 'connect', 'success');
+  }
   lead.status = 'connecting';
   lead.phase = String(plan.step.phase);
   lead.sequence_step = String(plan.stepIdx);
@@ -246,11 +278,11 @@ async function actionConnect(lead, plan) {
   lead.last_action_at = new Date().toISOString();
   lead.next_action_at = new Date(Date.now() + 2 * 24 * 3600 * 1000).toISOString();
   await updateLead(lead);
-  await logAction(lead.lead_id, 'connect', 'success');
 }
 
 async function actionCheckConnection(lead, plan) {
   const pid = leadProfileId(lead);
+  // Always runs — no LinkedIn side effect (just reads relationship status)
   const res = await checkRelationship(pid);
   recordRateLimit(res.rateLimit);
   const degree = (res.data.connectionDegree || res.data.distance || '').toString().toUpperCase();
@@ -282,15 +314,20 @@ async function actionDM(lead, list, plan, isFollowUp) {
   lead.personalization_context = ctx;
 
   const text = await generateDM(lead, list, isFollowUp);
+  console.log(`[dm] generated (${text.length} chars):\n---\n${text}\n---`);
 
-  // Simulate human typing speed: 200-300 chars/min ~ 4-5 chars/sec
   const typingMs = Math.min(text.length * 220, 12000);
-  const res = await sendMessageWithTyping(pid, text, typingMs);
-  recordRateLimit(res.rateLimit);
 
-  await advanceLead(lead, plan, isFollowUp ? 'follow_up' : 'dm');
+  if (FLAGS.dry_run) {
+    console.log(`[DRY] would send DM to ${pid} (${text.length} chars, ~${typingMs}ms typing)`);
+    await logAction(lead.lead_id, isFollowUp ? 'follow_up' : 'dm', 'success', `[DRY RUN] chars=${text.length}`);
+  } else {
+    const res = await sendMessageWithTyping(pid, text, typingMs);
+    recordRateLimit(res.rateLimit);
+    await logAction(lead.lead_id, isFollowUp ? 'follow_up' : 'dm', 'success', `chars=${text.length}`);
+  }
   await logConversation(lead.lead_id, 'outgoing', 'dm', text, false);
-  await logAction(lead.lead_id, isFollowUp ? 'follow_up' : 'dm', 'success', `chars=${text.length}`);
+  await advanceLead(lead, plan, isFollowUp ? 'follow_up' : 'dm');
 }
 
 async function actionDrop(lead, reason) {
@@ -318,10 +355,9 @@ async function advanceLead(lead, plan, actionName) {
   await updateLead(lead);
 }
 
-// ---- Reply polling ----
 async function pollReplies() {
   try {
-    const res = await getRecentMessages(true); // unread only
+    const res = await getRecentMessages(true);
     recordRateLimit(res.rateLimit);
     const conversations = res.data.conversations || res.data.messages || res.data || [];
     if (!Array.isArray(conversations) || !conversations.length) return;
