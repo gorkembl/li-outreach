@@ -9,8 +9,13 @@ let client = null;
 export function initClaude() {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) throw new Error('ANTHROPIC_API_KEY env var missing');
+  // Sanity check that all model names are configured
+  const required = ['context_model', 'comment_model', 'dm_model'];
+  for (const k of required) {
+    if (!CLAUDE[k]) throw new Error(`config.CLAUDE.${k} is not set — update src/config.js`);
+  }
   client = new Anthropic({ apiKey: key });
-  console.log('[claude] initialized');
+  console.log(`[claude] initialized (context=${CLAUDE.context_model}, comment=${CLAUDE.comment_model}, dm=${CLAUDE.dm_model})`);
 }
 
 // ----- Extract personalization context from profile + posts -----
