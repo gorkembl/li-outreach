@@ -54,17 +54,29 @@ async function main() {
       break;
     }
 
-    const plan = decideNextAction(lead, now);
-    if (!plan) continue;
+    console.log(`[scan] lead=${lead.lead_id} status="${lead.status}" list_id="${lead.list_id}" next_action_at="${lead.next_action_at}"`);
 
-    if (plan.action === 'qualify' && newLeadsToday >= LIMITS.daily_new_leads) continue;
+    const plan = decideNextAction(lead, now);
+    if (!plan) {
+      console.log(`[scan]   -> no action needed (decideNextAction returned null)`);
+      continue;
+    }
+    console.log(`[scan]   -> plan: ${plan.action}`);
+
+    if (plan.action === 'qualify' && newLeadsToday >= LIMITS.daily_new_leads) {
+      console.log(`[scan]   -> skipped: daily new lead cap reached`);
+      continue;
+    }
 
     const list = listById[lead.list_id];
     if (!list && plan.action !== 'qualify') {
-      console.warn(`[main] lead ${lead.lead_id} has unknown list_id ${lead.list_id}`);
+      console.warn(`[scan]   -> skipped: unknown list_id "${lead.list_id}". Known lists: ${Object.keys(listById).join(', ')}`);
       continue;
     }
-    if (list && list.active && String(list.active).toLowerCase() === 'false') continue;
+    if (list && list.active && String(list.active).toLowerCase() === 'false') {
+      console.log(`[scan]   -> skipped: list ${list.list_id} is inactive (active="${list.active}")`);
+      continue;
+    }
 
     try {
       await executeAction(lead, list, plan);
