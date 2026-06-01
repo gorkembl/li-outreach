@@ -1,7 +1,6 @@
 // connectsafely.js
-// ConnectSafely API wrapper. Endpoint paths marked TODO are placeholders —
-// to be confirmed via their Live Playground (https://connectsafely.ai/docs/api)
-// and updated before going live.
+// ConnectSafely API wrapper. All endpoints confirmed from official docs
+// at https://connectsafely.ai/docs/api as of 2026-05.
 
 const BASE_URL = 'https://api.connectsafely.ai';
 
@@ -13,17 +12,29 @@ export function initConnectSafely() {
   console.log('[cs] initialized');
 }
 
-async function call(method, path, body = null) {
+// Extract LinkedIn profileId from a profile URL.
+// "https://www.linkedin.com/in/john-doe-123/" -> "john-doe-123"
+export function extractProfileId(profileUrl) {
+  if (!profileUrl) return null;
+  const m = profileUrl.match(/linkedin\.com\/in\/([^/?#]+)/i);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+async function call(method, path, body = null, query = null) {
+  let url = `${BASE_URL}${path}`;
+  if (query) {
+    const qs = new URLSearchParams(query).toString();
+    url += `?${qs}`;
+  }
   const headers = {
     'Authorization': `Bearer ${API_KEY}`,
     'Content-Type': 'application/json',
   };
   const opts = { method, headers };
-  if (body) opts.body = JSON.stringify(body);
+  if (body && method !== 'GET') opts.body = JSON.stringify(body);
 
-  const res = await fetch(`${BASE_URL}${path}`, opts);
+  const res = await fetch(url, opts);
 
-  // Capture rate limit headers
   const rateLimit = {
     action: res.headers.get('X-RateLimit-Action'),
     limit: res.headers.get('X-RateLimit-Limit'),
@@ -37,7 +48,7 @@ async function call(method, path, body = null) {
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
   if (!res.ok) {
-    const err = new Error(`CS API ${res.status}: ${data.message || text}`);
+    const err = new Error(`CS API ${res.status} ${path}: ${data.message || data.error || text}`);
     err.status = res.status;
     err.data = data;
     err.rateLimit = rateLimit;
@@ -47,73 +58,122 @@ async function call(method, path, body = null) {
   return { data, rateLimit };
 }
 
-// ----- LinkedIn Profiles -----
-// TODO: confirm exact path from playground
-export async function fetchProfile(profileUrl) {
-  return call('POST', '/linkedin/profiles/fetch', { profile_url: profileUrl });
+// =====================================================================
+// LinkedIn Profiles
+// =====================================================================
+
+// Fetch profile by profileId (e.g. "john-doe-123")
+// Returns: firstName, lastName, headline, summary, location, currentPositions, etc.
+// Rate limit: 120 unique profiles per day (cached for 6h)
+export async function fetchProfile(profileId) {
+  return call('POST', '/linkedin/profile', { profileId });
 }
 
-// TODO: confirm path
-export async function fetchProfilePosts(profileUrl, limit = 10) {
-  return call('POST', '/linkedin/posts/by-profile', { profile_url: profileUrl, limit });
+// Visit a profile (registers as a profile view in LinkedIn)
+// This is what we use for Phase 1 "view" action
+export async function visitProfile(profileId) {
+  return call('POST', '/linkedin/profile/visit', { profileId });
 }
 
-// ----- LinkedIn Actions -----
-// TODO: confirm paths and body schemas via playground
+// =====================================================================
+// LinkedIn Posts
+// =====================================================================
 
-export async function viewProfile(profileUrl) {
-  return call('POST', '/linkedin/actions/view-profile', { profile_url: profileUrl });
+// Get latest posts from a profile
+// Returns array of posts with URN, content, engagement, timestamps
+export async function fetchProfilePosts(profileId, limit = 10, includeReposts = false) {
+  return call('POST', '/linkedin/posts/latest', {
+    profileId,
+    limit,
+    includeReposts,
+  });
 }
 
-export async function follow(profileUrl) {
-  return call('POST', '/linkedin/actions/follow', { profile_url: profileUrl });
+// React to a post
+// reaction options: LIKE, PRAISE, APPRECIATION, EMPATHY, INTEREST, ENTERTAINMENT
+export async function reactToPost(postUrn, reaction = 'LIKE') {
+  return call('POST', '/linkedin/posts/react', { postUrn, reaction });
 }
 
-export async function unfollow(profileUrl) {
-  return call('POST', '/linkedin/actions/unfollow', { profile_url: profileUrl });
-}
-
-export async function likePost(postUrn) {
-  return call('POST', '/linkedin/actions/react', { post_urn: postUrn, reaction: 'LIKE' });
-}
-
+// Comment on a post
 export async function commentOnPost(postUrn, text) {
-  return call('POST', '/linkedin/actions/comment', { post_urn: postUrn, text });
+  return call('POST', '/linkedin/posts/comment', { postUrn, text });
 }
 
-export async function sendConnectionRequest(profileUrl, message = null) {
-  const body = { profile_url: profileUrl };
-  if (message) body.message = message;
-  return call('POST', '/linkedin/actions/connect', body);
+// =====================================================================
+// LinkedIn Actions (follow, connect, message, relationship)
+// =====================================================================
+
+// Follow a profile (or unfollow with action: "unfollow")
+// Rate limit: 100 actions per day
+export async function followProfile(profileId) {
+  return call('POST', '/linkedin/follow', { profileId, action: 'follow' });
 }
 
-export async function checkConnectionStatus(profileUrl) {
-  return call('POST', '/linkedin/actions/connection-status', { profile_url: profileUrl });
+export async function unfollowProfile(profileId) {
+  return call('POST', '/linkedin/follow', { profileId, action: 'unfollow' });
 }
 
-export async function sendMessage(profileUrl, text) {
-  return call('POST', '/linkedin/messaging/send', { profile_url: profileUrl, text });
+// Send connection request (300 char limit on message; null = no note)
+export async function sendConnectionRequest(profileId, message = null) {
+  const body = { profileId };
+  if (message) body.message = message.slice(0, 300);
+  return call('POST', '/linkedin/connect', body);
 }
 
-// ----- Polling for replies -----
-export async function getRecentConversations(sinceISO = null) {
-  const body = sinceISO ? { since: sinceISO } : {};
-  return call('POST', '/linkedin/messaging/conversations', body);
+// Check relationship status with a profile
+// Returns: connectionDegree (DISTANCE_1, DISTANCE_2, DISTANCE_3, etc), follow status
+export async function checkRelationship(profileId) {
+  return call('GET', `/linkedin/relationship/${encodeURIComponent(profileId)}`);
 }
 
-// ----- Rate limit helper -----
-let lastFollowCheck = { remaining: null, reset: null, checkedAt: null };
+// Direct message (basic, requires 1st-degree connection)
+export async function sendMessage(recipientProfileId, message) {
+  return call('POST', '/linkedin/message', { recipientProfileId, message });
+}
+
+// Direct message with typing indicator (recommended for human-like behavior)
+export async function sendMessageWithTyping(recipientProfileId, message, typingDurationMs = null) {
+  const body = { recipientProfileId, message };
+  if (typingDurationMs) body.typingDurationMs = typingDurationMs;
+  return call('POST', '/linkedin/messaging/send-with-typing', body);
+}
+
+// =====================================================================
+// LinkedIn Messaging (polling for replies)
+// =====================================================================
+
+// Get recent messages/conversations
+// Used for polling: detect when leads reply
+// Rate limit: 150 messages per day per account
+export async function getRecentMessages(unreadOnly = false) {
+  const query = {};
+  if (unreadOnly) query.unreadOnly = 'true';
+  return call('GET', '/linkedin/messaging/recent-messages', null, query);
+}
+
+// =====================================================================
+// Rate limit tracking
+// =====================================================================
+
+const rateLimitState = {
+  FOLLOW: { remaining: null, reset: null, checkedAt: null },
+  PROFILE: { remaining: null, reset: null, checkedAt: null },
+  MESSAGE: { remaining: null, reset: null, checkedAt: null },
+};
 
 export function recordRateLimit(rateLimit) {
-  if (rateLimit.action === 'FOLLOW') {
-    lastFollowCheck = {
-      remaining: parseInt(rateLimit.remaining, 10),
+  if (!rateLimit || !rateLimit.action) return;
+  const key = rateLimit.action.toUpperCase();
+  if (rateLimitState[key]) {
+    rateLimitState[key] = {
+      remaining: rateLimit.remaining ? parseInt(rateLimit.remaining, 10) : null,
       reset: rateLimit.reset,
       checkedAt: new Date(),
     };
   }
 }
 
-export function getFollowRemaining() {
-  return lastFollowCheck.remaining;
+export function getRateLimitState(action) {
+  return rateLimitState[action.toUpperCase()] || null;
 }
