@@ -80,11 +80,12 @@ export async function visitProfile(profileId) {
 // =====================================================================
 
 // Get latest posts from a profile
+// API parameter is `count` (not `limit`). Max 20.
 // Returns array of posts with URN, content, engagement, timestamps
-export async function fetchProfilePosts(profileId, limit = 10, includeReposts = false) {
+export async function fetchProfilePosts(profileId, count = 20, includeReposts = false) {
   return call('POST', '/linkedin/posts/latest', {
     profileId,
-    limit,
+    count,
     includeReposts,
   });
 }
