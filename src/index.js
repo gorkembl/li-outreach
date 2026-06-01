@@ -150,14 +150,19 @@ async function actionQualify(lead, list) {
   const posts = postsRaw.posts || postsRaw.data || (Array.isArray(postsRaw) ? postsRaw : []);
   console.log(`[qualify] parsed ${Array.isArray(posts) ? posts.length : 0} posts`);
 
+  // ConnectSafely wraps profile data in a nested `profile` object.
+  // Field names: aboutText (not about), experience array with {title, companyName, duration, location}
+  const p = profile.profile || profile; // fallback if response shape changes
   const profileForClaude = {
-    name: [profile.firstName, profile.lastName].filter(Boolean).join(' ') || profile.name,
-    headline: profile.headline,
-    location: profile.location || profile.geoLocation,
-    about: profile.summary || profile.about,
-    experience: profile.currentPositions || profile.experience,
+    name: [p.firstName, p.lastName].filter(Boolean).join(' ') || p.name || '',
+    headline: p.headline || '',
+    location: p.location?.geoLocationName || p.location?.name || p.location || '',
+    about: p.aboutText || p.summary || p.about || '',
+    experience: p.experience || p.currentPositions || [],
+    followerCount: p.followerCount,
+    isPremium: p.isPremium,
   };
-  console.log(`[qualify] profileForClaude: ${JSON.stringify(profileForClaude).slice(0, 600)}`);
+  console.log(`[qualify] profileForClaude: ${JSON.stringify(profileForClaude).slice(0, 800)}`);
 
   console.log(`[qualify] calling Claude for context extraction`);
   const ctx = await extractContext(profileForClaude, posts);
@@ -234,7 +239,7 @@ async function actionLike(lead, list, plan) {
   if (!posts.length) throw new Error('no posts available to like');
 
   const target = posts[0];
-  const postUrn = target.urn || target.postUrn || target.shareUrn || target.id;
+  const postUrn = target.activityUrn || target.urn || target.postUrn || target.shareUrn || target.id;
   if (!postUrn) throw new Error('post URN not found in response');
 
   if (FLAGS.dry_run) {
@@ -256,7 +261,7 @@ async function actionComment(lead, list, plan) {
   if (!posts.length) throw new Error('no posts available to comment on');
 
   const target = posts[0];
-  const postUrn = target.urn || target.postUrn || target.shareUrn || target.id;
+  const postUrn = target.activityUrn || target.urn || target.postUrn || target.shareUrn || target.id;
   if (!postUrn) throw new Error('post URN not found');
 
   const ctx = typeof lead.personalization_context === 'string'
