@@ -27,7 +27,7 @@ About: ${(profile.about || '').slice(0, 1500)}
 Experience summary: ${JSON.stringify(profile.experience?.slice(0, 3) || [])}
 
 RECENT POSTS (last ${posts.length}):
-${posts.map((p, i) => `[${i + 1}] ${(p.text || '').slice(0, 400)}`).join('\n\n')}
+${posts.map((p, i) => `[${i + 1}] ${((p.content || p.text || p.commentary || '')).slice(0, 400)}`).join('\n\n')}
 
 Return JSON with this shape:
 {
@@ -46,7 +46,7 @@ Return JSON with this shape:
 Be honest: if posts are 60+ days old or profile looks dormant, set skip_reason.`;
 
   const res = await client.messages.create({
-    model: CLAUDE.model,
+    model: CLAUDE.context_model,
     max_tokens: CLAUDE.max_tokens_context,
     system: sys,
     messages: [{ role: 'user', content: user }],
@@ -77,7 +77,7 @@ Language: ${lead.personalization_context?.language || 'en'}
 Write ONE comment. Plain text only, no quotes, no preamble.`;
 
   const res = await client.messages.create({
-    model: CLAUDE.model,
+    model: CLAUDE.comment_model,
     max_tokens: CLAUDE.max_tokens_comment,
     system: sys,
     messages: [{ role: 'user', content: user }],
@@ -138,7 +138,7 @@ ${gdprNote}${followUpNote}
 Plain text only. Just the DM body.`;
 
   const res = await client.messages.create({
-    model: CLAUDE.model,
+    model: CLAUDE.dm_model,
     max_tokens: CLAUDE.max_tokens_dm,
     system: sys,
     messages: [{ role: 'user', content: user }],
