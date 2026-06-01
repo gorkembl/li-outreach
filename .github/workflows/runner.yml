@@ -14,6 +14,7 @@ on:
         options:
           - normal
           - dry-run
+          - fast-test
           - init-sheet-only
 
 concurrency:
@@ -43,7 +44,8 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           DAILY_NEW_LEADS: ${{ vars.DAILY_NEW_LEADS || '5' }}
           DAILY_TOTAL_ACTIONS: ${{ vars.DAILY_TOTAL_ACTIONS || '40' }}
-          DRY_RUN: ${{ github.event.inputs.mode == 'dry-run' && 'true' || 'false' }}
+          DRY_RUN: ${{ (github.event.inputs.mode == 'dry-run' || github.event.inputs.mode == 'fast-test') && 'true' || 'false' }}
+          DEBUG_FAST_SEQUENCE: ${{ github.event.inputs.mode == 'fast-test' && 'true' || 'false' }}
         run: |
           if [ "${{ github.event.inputs.mode }}" = "init-sheet-only" ]; then
             npm run init-sheet
