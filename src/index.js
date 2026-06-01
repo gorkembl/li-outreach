@@ -138,12 +138,17 @@ async function actionQualify(lead, list) {
   const profileRes = await fetchProfile(profileId);
   recordRateLimit(profileRes.rateLimit);
   const profile = profileRes.data;
+  console.log(`[qualify] raw profile response keys: ${Object.keys(profile || {}).join(', ')}`);
+  console.log(`[qualify] raw profile (first 1500 chars):\n${JSON.stringify(profile).slice(0, 1500)}`);
 
   console.log(`[qualify] fetching posts: ${profileId}`);
   const postsRes = await fetchProfilePosts(profileId, 10);
   recordRateLimit(postsRes.rateLimit);
-  const posts = postsRes.data.posts || postsRes.data || [];
-  console.log(`[qualify] got ${Array.isArray(posts) ? posts.length : 0} posts`);
+  const postsRaw = postsRes.data;
+  console.log(`[qualify] raw posts response keys: ${Object.keys(postsRaw || {}).join(', ')}`);
+  console.log(`[qualify] raw posts (first 1500 chars):\n${JSON.stringify(postsRaw).slice(0, 1500)}`);
+  const posts = postsRaw.posts || postsRaw.data || (Array.isArray(postsRaw) ? postsRaw : []);
+  console.log(`[qualify] parsed ${Array.isArray(posts) ? posts.length : 0} posts`);
 
   const profileForClaude = {
     name: [profile.firstName, profile.lastName].filter(Boolean).join(' ') || profile.name,
@@ -152,6 +157,7 @@ async function actionQualify(lead, list) {
     about: profile.summary || profile.about,
     experience: profile.currentPositions || profile.experience,
   };
+  console.log(`[qualify] profileForClaude: ${JSON.stringify(profileForClaude).slice(0, 600)}`);
 
   console.log(`[qualify] calling Claude for context extraction`);
   const ctx = await extractContext(profileForClaude, posts);
