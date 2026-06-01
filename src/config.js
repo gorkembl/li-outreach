@@ -139,6 +139,19 @@ export const CLAUDE = {
 export const FLAGS = {
   dry_run: process.env.DRY_RUN === 'true',
   init_sheet_only: process.argv.includes('--init-sheet-only'),
+  // When DEBUG_FAST_SEQUENCE=true, all sequence steps run with day=0 jitter=0,
+  // so the entire sequence can be observed in a single run. For testing only.
+  debug_fast_sequence: process.env.DEBUG_FAST_SEQUENCE === 'true',
   // EU/UK/UK regions get opt-out line appended to first DM (GDPR)
   gdpr_regions: ['EU', 'UK', 'EEA'],
 };
+
+// If debug_fast_sequence is on, collapse all SEQUENCE day/jitter values to 0.
+// We apply this transform at module load so the rest of the code is unaware.
+if (FLAGS.debug_fast_sequence) {
+  for (const step of SEQUENCE) {
+    step.day = 0;
+    step.jitter_hours = 0;
+  }
+  console.log('[config] DEBUG_FAST_SEQUENCE active — all sequence steps collapsed to day=0');
+}
