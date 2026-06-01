@@ -114,8 +114,22 @@ export const CRITERIA = {
 };
 
 // Claude model selection
+// Available models (as of June 2026):
+//   'claude-opus-4-7'              - most capable, ~5x Sonnet cost
+//   'claude-opus-4-6'              - previous gen Opus
+//   'claude-sonnet-4-6'            - balanced, recommended default
+//   'claude-haiku-4-5-20251001'    - fast and cheap, ~1/4 Sonnet cost
+// You can mix and match per task to optimize cost vs quality.
+// Use versioned strings (with date suffix) in production, not aliases.
 export const CLAUDE = {
-  model: 'claude-sonnet-4-5',
+  // Profile analysis -> structured JSON. Haiku is sufficient here.
+  context_model: 'claude-haiku-4-5-20251001',
+  // Peer-style comments on posts. Needs nuance, Sonnet recommended.
+  comment_model: 'claude-sonnet-4-6',
+  // First DMs and follow-ups. Highest stakes, Sonnet or Opus.
+  dm_model: 'claude-sonnet-4-6',
+
+  // Token budgets
   max_tokens_context: 1500,
   max_tokens_dm: 400,
   max_tokens_comment: 200,
