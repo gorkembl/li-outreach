@@ -49,50 +49,65 @@ async function main() {
   const shuffled = [...allLeads].sort(() => Math.random() - 0.5);
 
   for (const lead of shuffled) {
-    if (actionsToday >= LIMITS.daily_total_actions) {
-      console.log('[main] daily action budget reached, stopping');
-      break;
+    // For each lead, keep running actions until decideNextAction returns null.
+    // In normal mode, the natural exit is hitting next_action_at in the future.
+    // In fast-test mode, since all delays collapse to 0, the lead's full sequence
+    // runs in one pass.
+    let leadActions = 0;
+    const maxPerLead = FLAGS.debug_fast_sequence ? 25 : 1;
+
+    while (leadActions < maxPerLead) {
+      if (actionsToday >= LIMITS.daily_total_actions) {
+        console.log('[main] daily action budget reached, stopping');
+        break;
+      }
+
+      console.log(`[scan] lead=${lead.lead_id} status="${lead.status}" list_id="${lead.list_id}" next_action_at="${lead.next_action_at}"`);
+
+      const plan = decideNextAction(lead, now);
+      if (!plan) {
+        console.log(`[scan]   -> no action needed (decideNextAction returned null)`);
+        break; // move to next lead
+      }
+      console.log(`[scan]   -> plan: ${plan.action}`);
+
+      if (plan.action === 'qualify' && newLeadsToday >= LIMITS.daily_new_leads) {
+        console.log(`[scan]   -> skipped: daily new lead cap reached`);
+        break;
+      }
+
+      const list = listById[lead.list_id];
+      if (!list && plan.action !== 'qualify') {
+        console.warn(`[scan]   -> skipped: unknown list_id "${lead.list_id}". Known lists: ${Object.keys(listById).join(', ')}`);
+        break;
+      }
+      if (list && list.active && String(list.active).toLowerCase() === 'false') {
+        console.log(`[scan]   -> skipped: list ${list.list_id} is inactive (active="${list.active}")`);
+        break;
+      }
+
+      try {
+        await executeAction(lead, list, plan);
+        actionsToday++;
+        leadActions++;
+        if (plan.action === 'qualify') newLeadsToday++;
+        const sleepMs = FLAGS.debug_fast_sequence
+          ? 1_000  // 1 second in fast-test
+          : (FLAGS.dry_run
+            ? DRY_RUN_SLEEP_MS
+            : (LIMITS.min_seconds_between_actions * 1000 + Math.random() * 60_000));
+        await sleep(sleepMs);
+      } catch (e) {
+        console.error(`[main] error on lead ${lead.lead_id} action ${plan.action}:`, e.message);
+        lead.status = 'error';
+        lead.notes = `[${new Date().toISOString()}] ${plan.action} failed: ${e.message}\n${lead.notes || ''}`;
+        await updateLead(lead);
+        await logAction(lead.lead_id, plan.action, 'error', e.message);
+        break; // stop processing this lead
+      }
     }
 
-    console.log(`[scan] lead=${lead.lead_id} status="${lead.status}" list_id="${lead.list_id}" next_action_at="${lead.next_action_at}"`);
-
-    const plan = decideNextAction(lead, now);
-    if (!plan) {
-      console.log(`[scan]   -> no action needed (decideNextAction returned null)`);
-      continue;
-    }
-    console.log(`[scan]   -> plan: ${plan.action}`);
-
-    if (plan.action === 'qualify' && newLeadsToday >= LIMITS.daily_new_leads) {
-      console.log(`[scan]   -> skipped: daily new lead cap reached`);
-      continue;
-    }
-
-    const list = listById[lead.list_id];
-    if (!list && plan.action !== 'qualify') {
-      console.warn(`[scan]   -> skipped: unknown list_id "${lead.list_id}". Known lists: ${Object.keys(listById).join(', ')}`);
-      continue;
-    }
-    if (list && list.active && String(list.active).toLowerCase() === 'false') {
-      console.log(`[scan]   -> skipped: list ${list.list_id} is inactive (active="${list.active}")`);
-      continue;
-    }
-
-    try {
-      await executeAction(lead, list, plan);
-      actionsToday++;
-      if (plan.action === 'qualify') newLeadsToday++;
-      const sleepMs = FLAGS.dry_run
-        ? DRY_RUN_SLEEP_MS
-        : (LIMITS.min_seconds_between_actions * 1000 + Math.random() * 60_000);
-      await sleep(sleepMs);
-    } catch (e) {
-      console.error(`[main] error on lead ${lead.lead_id} action ${plan.action}:`, e.message);
-      lead.status = 'error';
-      lead.notes = `[${new Date().toISOString()}] ${plan.action} failed: ${e.message}\n${lead.notes || ''}`;
-      await updateLead(lead);
-      await logAction(lead.lead_id, plan.action, 'error', e.message);
-    }
+    if (actionsToday >= LIMITS.daily_total_actions) break;
   }
 
   console.log(`=== run complete: ${actionsToday} actions, ${newLeadsToday} new leads qualified ===`);
