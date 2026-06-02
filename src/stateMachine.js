@@ -1,7 +1,7 @@
 // stateMachine.js
 // Core decision logic. Given a lead's state, determines next action.
 
-import { SEQUENCE, CRITERIA, WORKING_HOURS, LIMITS } from './config.js';
+import { SEQUENCE, CRITERIA, WORKING_HOURS, LIMITS, FLAGS } from './config.js';
 
 // Returns an action plan for a lead, or null if nothing to do right now.
 // Possible returns:
@@ -49,7 +49,7 @@ export function decideNextAction(lead, now = new Date()) {
   // Active states — check if due for next step
   if (['viewing', 'following', 'warming', 'connected', 'dm_sent', 'follow_up_sent'].includes(status)) {
     if (!isDue(lead.next_action_at, now)) return null;
-    if (!isWithinWorkingHours(now, lead.timezone)) return null;
+    if (!FLAGS.debug_fast_sequence && !isWithinWorkingHours(now, lead.timezone)) return null;
 
     const stepIdx = parseInt(lead.sequence_step, 10);
     const nextIdx = isNaN(stepIdx) ? 0 : stepIdx + 1;
